@@ -3,7 +3,8 @@
 // Writes the front-page image (entry.png, 1024x1024, under 1 MiB) to
 // $MAKEFUN_OUTPUT_DIR/entry.png. Node 22, standard library only, no network.
 // Before copying it validates the PNG signature, the 1 MiB size cap and the
-// 1024x1024 dimensions from the IHDR chunk, then verifies the copy is
+// 1024x1024 dimensions from the IHDR chunk, verifies the IHDR chunk's CRC32
+// so a corrupted header cannot slip through, then verifies the copy is
 // byte-for-byte identical, so two runs always write the same bytes.
 
 import { copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -19,6 +20,25 @@ function fail(message) {
   throw new Error(`entry.png rejected: ${message}`);
 }
 
+// CRC-32 (IEEE 802.3, polynomial 0xEDB88320), computed over a chunk's type
+// and data fields exactly as PNG stores it. Node's stdlib exposes no CRC32,
+// so the table is built once at startup.
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const b of bytes) crc = CRC32_TABLE[(crc ^ b) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function checkPng(bytes) {
   if (bytes.length < 33) fail(`too short (${bytes.length} bytes)`);
   if (!bytes.subarray(0, 8).equals(PNG_MAGIC)) fail("bad PNG signature");
@@ -30,6 +50,11 @@ function checkPng(bytes) {
   if (width > MAX_SIDE || height > MAX_SIDE) {
     fail(`dimensions ${width}x${height} over the 1024x1024 cap`);
   }
+  // The IHDR CRC covers bytes 12..29 (chunk type + 13 data bytes); the
+  // stored CRC is the next 4 bytes. A mismatch means the header itself is
+  // corrupt even though the signature and dimensions still parse.
+  const storedCrc = bytes.readUInt32BE(29);
+  if (crc32(bytes.subarray(12, 29)) !== storedCrc) fail("IHDR CRC mismatch");
   return { width, height };
 }
 
